@@ -55,7 +55,7 @@ BUY_AMOUNT=0.0001
 # The time interval in seconds in which tokens are bought
 BUY_INTERVAL=15
 # Treshold when the tokens are sold. to not crash the chart too much.
-SELL_TRESHOLD=0.2
+SELL_THRESHOLD=0.2
 # The amount in Solana you want to add as priorioty fee for each transaction.
 PRIORITY_FEE=0.00003
 # Slipage in decimals. 0.1 = 10%
