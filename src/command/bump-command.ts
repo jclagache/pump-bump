@@ -1,40 +1,79 @@
 //import PumpFunTrader from '@degenfrends/solana-pumpfun-trader';
-import getBalance from '../solana/get-balance';
-import getTokenAccount from '../solana/get-token-account';
-import getTokenBalance from '../solana/get-token-balance';
+import getBalance from '../solana/get-balance.js';
+import getTokenAccount from '../solana/get-token-account.js';
+import getTokenBalance from '../solana/get-token-balance.js';
 import { DEFAULT_DECIMALS, PumpFunSDK } from 'pumpdotfun-sdk';
-import NodeWallet from '@coral-xyz/anchor/dist/cjs/nodewallet';
+// Import RaydiumSDK dynamically
+// import { RaydiumSDK } from 'raydium-sdk';
 import { AnchorProvider } from '@coral-xyz/anchor';
 import { config } from 'dotenv';
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, Transaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 config();
+
+// Dynamic import for NodeWallet
+// @ts-ignore
+import * as anchor from '@coral-xyz/anchor';
+const NodeWallet = anchor.Wallet || ((await import('@coral-xyz/anchor')).Wallet);
+
+// Dynamic import for RaydiumSDK
+let RaydiumSDK: any;
+try {
+    const raydiumModule = await import('raydium-sdk');
+    RaydiumSDK = raydiumModule.RaydiumSDK;
+} catch (error) {
+    console.error('Error importing RaydiumSDK:', error);
+}
 
 export default class BumpCommand {
     private bumperPrivateKey: string;
     private mintAddress: string;
     private walletAddress: string;
     private provider: any;
-    private sdk: PumpFunSDK;
-    SLIPPAGE_BASIS_POINTS = 100n;
-    buyTokens = async (sdk: PumpFunSDK, testAccount: Keypair, mint: PublicKey, solAmount: number) => {
-        const buyResults = await sdk.buy(testAccount, mint, BigInt(solAmount * LAMPORTS_PER_SOL), this.SLIPPAGE_BASIS_POINTS);
+    private sdk: typeof RaydiumSDK | PumpFunSDK;
+    private isBumping: boolean = false;
+    private consecutiveErrors: number = 0;
+    private maxConsecutiveErrors: number = 5;
+    private baseRetryDelay: number = 1000; // 1 second base delay
+    SLIPPAGE_BASIS_POINTS = 500n;
+
+    buyTokens = async (testAccount: Keypair, mint: PublicKey, solAmount: number) => {
+        const buyResults = await this.sdk.buy(testAccount, mint, BigInt(solAmount * LAMPORTS_PER_SOL), this.SLIPPAGE_BASIS_POINTS);
 
         if (buyResults.success) {
             console.log('Buy successful');
         } else {
             console.log('Buy failed');
         }
+
+        return buyResults.success;
     };
-    sellTokens = async (sdk: PumpFunSDK, testAccount: Keypair, mint: PublicKey, tokenAmount: number) => {
-        const sellResults = await sdk.sell(testAccount, mint, BigInt(tokenAmount * Math.pow(10, DEFAULT_DECIMALS)), this.SLIPPAGE_BASIS_POINTS);
+    sellTokens = async (testAccount: Keypair, mint: PublicKey, tokenAmount: number) => {
+        const sellResults = await this.sdk.sell(testAccount, mint, BigInt(tokenAmount * Math.pow(10, DEFAULT_DECIMALS)), this.SLIPPAGE_BASIS_POINTS);
 
         if (sellResults.success) {
             console.log('Sell successful');
         } else {
             console.log('Sell failed');
+            console.log(sellResults.error);
         }
+
+        return sellResults.success;
     };
+
+    buyAndSellTokens = async (testAccount: Keypair, mint: PublicKey, solAmount: number) => {
+        const buyAndSellResults = await this.sdk.buyAndSell(testAccount, mint, BigInt(solAmount * LAMPORTS_PER_SOL), this.SLIPPAGE_BASIS_POINTS);
+
+        if (buyAndSellResults.success) {
+            console.log('Buy and sell successful');
+        } else {
+            console.log('Buy and sell failed');
+        }
+
+        return buyAndSellResults.success;
+
+    };
+
     getProvider = () => {
         if (!process.env.RPC_URL) {
             throw new Error('Please set HELIUS_RPC_URL in .env file');
@@ -44,20 +83,112 @@ export default class BumpCommand {
         const wallet = new NodeWallet(new Keypair());
         return new AnchorProvider(connection, wallet, { commitment: 'finalized' });
     };
-    constructor(privateKey: string, mintAddress: string, walletAddress: string) {
+
+    // Change constructor to not use await
+    private constructor(privateKey: string, mintAddress: string, walletAddress: string) {
         this.bumperPrivateKey = privateKey;
         this.mintAddress = mintAddress;
         this.walletAddress = walletAddress;
         this.provider = this.getProvider();
-        this.sdk = new PumpFunSDK(this.provider);
     }
+
     async main() {
         const tokenAccount = await getTokenAccount(this.walletAddress, this.mintAddress);
         const interval = Number(process.env.BUY_INTERVAL);
-        setInterval(async () => {
-            await this.bump(tokenAccount);
-        }, interval * 1000);
+
+        // Initial call
+        this.scheduleBump(tokenAccount, interval);
     }
+
+    private scheduleBump(tokenAccount: string | undefined, interval: number, retryDelay: number = 0): NodeJS.Timeout {
+        const actualDelay = retryDelay > 0 ? retryDelay : interval * 1000;
+
+        return setTimeout(async () => {
+            if (!this.isBumping) {
+                try {
+                    console.log('This is the first bump or previous bump operation completed');
+                    this.isBumping = true;
+                    await this.bump(tokenAccount);
+                    // Réinitialiser le compteur d'erreurs après un succès
+                    this.consecutiveErrors = 0;
+                } catch (error) {
+                    console.error('Error in scheduleBump:', error);
+                    this.consecutiveErrors++;
+                    console.log(`Consecutive errors: ${this.consecutiveErrors}/${this.maxConsecutiveErrors}`);
+
+                    if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
+                        console.error('Too many consecutive errors, stopping the bot');
+                        return; // Arrêter si trop d'erreurs consécutives
+                    }
+                } finally {
+                    this.isBumping = false;
+
+                    // Calculer le délai de réessai en cas d'erreur
+                    let nextDelay = 0;
+                    if (this.consecutiveErrors > 0) {
+                        // Backoff exponentiel: délai de base * 2^(nombre d'erreurs), mais pas plus du double de l'intervalle normal
+                        const backoffDelay = this.baseRetryDelay * Math.pow(2, this.consecutiveErrors - 1);
+                        nextDelay = Math.min(backoffDelay, interval * 2000);
+                        console.log(`Retrying in ${nextDelay / 1000} seconds due to errors`);
+                    }
+
+                    // Programmer le prochain appel
+                    this.scheduleBump(tokenAccount, interval, nextDelay);
+                }
+            } else {
+                console.log('Previous bump operation still running, skipping this iteration');
+                // Programmer le prochain contrôle
+                this.scheduleBump(tokenAccount, interval);
+            }
+        }, actualDelay);
+    }
+
+    /**
+     * Parse the private key, which can be either:
+     * - a JSON array string (e.g. "[4,182,130,...]")
+     * - a base58 string
+     * - an array of numbers
+     * Returns a Uint8Array suitable for Keypair.fromSecretKey
+     */
+    private parsePrivateKey(privateKey: string | number[]): Uint8Array {
+        console.log("Debug - Private key type:", typeof privateKey);
+
+        if (typeof privateKey === 'string') {
+            try {
+                // Try to parse as JSON array
+                const arr = JSON.parse(privateKey);
+                if (Array.isArray(arr) && arr.every(n => typeof n === 'number')) {
+                    console.log("Debug - Private key format: JSON array");
+                    return new Uint8Array(arr);
+                }
+            } catch {
+                // Not a JSON array, treat as base58
+                console.log("Debug - Private key format: base58 string");
+                try {
+                    return new Uint8Array(bs58.decode(privateKey));
+                } catch (error: unknown) {
+                    const errorMessage = error instanceof Error ? error.message : String(error);
+                    console.error("Error decoding base58 private key:", error);
+                    throw new Error(`Cannot decode private key: ${errorMessage}`);
+                }
+            }
+            // If JSON.parse succeeded but result is not an array, treat as base58
+            console.log("Debug - Private key format: JSON parsed, not array, treating as base58");
+            try {
+                return new Uint8Array(bs58.decode(privateKey));
+            } catch (error: unknown) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                console.error("Error decoding base58 private key:", error);
+                throw new Error(`Cannot decode private key: ${errorMessage}`);
+            }
+        } else if (Array.isArray(privateKey)) {
+            // Already an array
+            console.log("Debug - Private key format: array");
+            return new Uint8Array(privateKey);
+        }
+        throw new Error(`Invalid private key format: ${typeof privateKey}`);
+    }
+
     async bump(tokenAccount: string | undefined) {
         console.log('Bumping token:', tokenAccount);
         const solIn = Number(process.env.BUY_AMOUNT);
@@ -68,9 +199,21 @@ export default class BumpCommand {
         console.log('Priority fee:', priorityFeeInSol);
         const sellThreshold = Number(process.env.SELL_THRESHOLD);
         console.log('Sell threshold:', sellThreshold);
-        const walletPrivateKey = await Keypair.fromSecretKey(new Uint8Array(bs58.decode(this.bumperPrivateKey)));
 
         try {
+            // Use the utility function to parse the private key in both formats
+            console.log("Attempting to create Keypair from private key");
+            const secretKey = this.parsePrivateKey(this.bumperPrivateKey);
+            const walletPrivateKey = Keypair.fromSecretKey(secretKey);
+
+            // Vérifier que la clé publique correspond à l'adresse du portefeuille
+            const publicKeyString = walletPrivateKey.publicKey.toBase58();
+            console.log("Created Keypair with public key:", publicKeyString);
+
+            if (publicKeyString !== this.walletAddress) {
+                console.warn(`Warning: Public key (${publicKeyString}) does not match wallet address (${this.walletAddress})`);
+            }
+
             let tokenBalance = 0;
 
             if (tokenAccount) {
@@ -79,17 +222,55 @@ export default class BumpCommand {
             console.log('Token balance:', tokenBalance);
             const solBalance = await getBalance(this.walletAddress);
             console.log('Sol balance:', solBalance);
-            if (solBalance < solIn + sellThreshold && tokenBalance > 0) {
-                console.log('Selling token');
-                const sellRespponse = await this.sellTokens(this.sdk, walletPrivateKey, new PublicKey(this.mintAddress), tokenBalance);
-                console.log('sold token: ', sellRespponse);
+            if (solBalance < solIn + sellThreshold) {
+                console.log('Stop bot: insufficient balance');
+                throw new Error('Insufficient balance to continue');
             }
             console.log('Buying token');
-            const buyResponse = await this.buyTokens(this.sdk, walletPrivateKey, new PublicKey(this.mintAddress), solIn);
-            console.log('Bump successful: ', buyResponse);
-        } catch (error) {
-            console.error('Error in main function:', error);
-            this.bump(tokenAccount);
+            const buyAndSellResponse = await this.buyAndSellTokens(walletPrivateKey, new PublicKey(this.mintAddress), solIn);
+            console.log('Bump successful: ', buyAndSellResponse);
+        } catch (error: unknown) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            console.error('Error in bump function:', errorMessage);
+            throw error;
+        }
+    }
+
+    // Factory method to create instances that checks if token is tradable on Raydium or PumpFun
+    static async create(privateKey: string, mintAddress: string, walletAddress: string) {
+        const instance = new BumpCommand(privateKey, mintAddress, walletAddress);
+
+        // First, check if tradable on Raydium
+        try {
+            const isTradableOnRaydium = await RaydiumSDK.isTradable(
+                new PublicKey(mintAddress),
+                instance.provider.connection
+            );
+
+            if (isTradableOnRaydium) {
+                console.log('Token is tradable on Raydium');
+                instance.sdk = new RaydiumSDK(instance.provider.connection, Keypair.fromSecretKey(instance.parsePrivateKey(privateKey)));
+                return instance;
+            }
+
+            // If not tradable on Raydium, check PumpFun
+            const isTradableOnPumpfun = await PumpFunSDK.isTradable(
+                new PublicKey(mintAddress),
+                instance.provider.connection
+            );
+
+            if (isTradableOnPumpfun) {
+                console.log('Token is tradable on PumpFun');
+                instance.sdk = new PumpFunSDK(instance.provider);
+                return instance;
+            }
+
+            // If not tradable on either, throw an error
+            throw new Error('Token is not tradable on Raydium nor PumpFun');
+        } catch (error: unknown) {
+            console.error('Error checking if token is tradable:', error);
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            throw new Error(`Failed to verify if token is tradable: ${errorMessage}`);
         }
     }
 }

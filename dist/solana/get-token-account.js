@@ -1,14 +1,11 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.default = getTokenAccount;
-const web3_js_1 = require("@solana/web3.js");
-const dotenv_1 = require("dotenv");
-(0, dotenv_1.config)();
-async function getTokenAccount(walletAddress, mintAddress) {
-    const connection = new web3_js_1.Connection(String(process.env.RPC_URL), 'confirmed');
-    const wallet = new web3_js_1.PublicKey(walletAddress);
+import { Connection, PublicKey } from '@solana/web3.js';
+import { config } from 'dotenv';
+config();
+export default async function getTokenAccount(walletAddress, mintAddress) {
+    const connection = new Connection(String(process.env.RPC_URL), 'confirmed');
+    const wallet = new PublicKey(walletAddress);
     const account = await connection.getTokenAccountsByOwner(wallet, {
-        mint: new web3_js_1.PublicKey(mintAddress)
+        mint: new PublicKey(mintAddress)
     });
     if (!account.value) {
         return undefined;
